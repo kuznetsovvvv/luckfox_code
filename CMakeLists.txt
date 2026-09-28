@@ -44,6 +44,5 @@ target_link_libraries(qr_scanner
     ${OpenCV_LIBRARIES}
     pthread
     dl
-    z
     m
 )

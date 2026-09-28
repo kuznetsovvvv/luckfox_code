@@ -1,7 +1,6 @@
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <vector>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -13,7 +12,7 @@
 #include <sys/mman.h>
 #include <linux/videodev2.h>
 
-// Сокеты для HTTP (вместо libcurl)
+// Сокеты для HTTP
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -26,9 +25,14 @@
 #include <ZXing/ImageView.h>
 
 const std::string LOG_FILE = "qr_scanner.log";
-const std::string SERVER_IP = "192.168.1.102";
-const int SERVER_PORT = 5000;
-const std::string SERVER_PATH = "/verify-qr";
+
+// --- НАСТРОЙКИ СЕРВЕРА ---
+const std::string SERVER_IP = "172.32.0.100"; // Или 172.32.0.100 для USB RNDIS
+const int SERVER_PORT = 8080;
+const std::string SERVER_PATH = "/api/validate-qr";
+
+// --- НАСТРОЙКИ ПОВЕДЕНИЯ ---
+const int COOLDOWN_SECONDS = 4; 
 
 std::mutex log_mutex;
 
@@ -57,25 +61,21 @@ std::string escape_json(const std::string& s) {
     return o;
 }
 
-// Отправка HTTP POST через POSIX сокеты
 bool send_to_server(const std::string& qr_text) {
-    log("Отправка токена на сервер по сокетам...");
+    log("Отправка токена на сервер: " + SERVER_IP + ":" + std::to_string(SERVER_PORT) + SERVER_PATH);
 
-    // 1. Создаем сокет
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         log("ОШИБКА СЕТИ: Не удалось создать сокет");
         return false;
     }
 
-    // Настраиваем таймаут на чтение/запись (5 секунд)
     struct timeval tv;
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    // 2. Подключаемся к серверу
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(SERVER_PORT);
@@ -86,12 +86,11 @@ bool send_to_server(const std::string& qr_text) {
     }
 
     if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        log("ОШИБКА СЕТИ: Не удалось подключиться к серверу (сервер недоступен?)");
+        log("ОШИБКА СЕТИ: Не удалось подключиться к серверу");
         close(sock);
         return false;
     }
 
-    // 3. Формируем HTTP POST запрос вручную
     std::string body = "{\"qr_data\": \"" + escape_json(qr_text) + "\"}";
     std::stringstream request;
     request << "POST " << SERVER_PATH << " HTTP/1.1\r\n"
@@ -103,14 +102,12 @@ bool send_to_server(const std::string& qr_text) {
 
     std::string req_str = request.str();
     
-    // 4. Отправляем запрос
     if (send(sock, req_str.c_str(), req_str.length(), 0) < 0) {
         log("ОШИБКА СЕТИ: Ошибка отправки данных");
         close(sock);
         return false;
     }
 
-    // 5. Читаем ответ
     std::string response = "";
     char buffer[1024];
     int bytes;
@@ -125,105 +122,106 @@ bool send_to_server(const std::string& qr_text) {
         return false;
     }
 
-    // 6. Парсим HTTP ответ (отделяем заголовки от тела)
     size_t body_start = response.find("\r\n\r\n");
     std::string response_body = (body_start != std::string::npos) ? response.substr(body_start + 4) : response;
 
-    // Простая проверка статуса
     if (response_body.find("\"status\": \"success\"") != std::string::npos || 
         response_body.find("\"status\":\"success\"") != std::string::npos) {
-        log("==== ПРОПУСТИТЬ ====");
-        log("Ответ сервера: " + response_body);
+        log("Сервер ответил: УСПЕХ");
         return true;
     } else {
-        log("==== ОТКАЗАНО ====");
-        log("Ответ сервера: " + response_body);
+        log("Сервер ответил: ОТКАЗ");
         return false;
     }
 }
 
-// Класс захвата камеры через V4L2 Multiplanar API
+// Класс захвата камеры с автоподбором формата
 class V4L2Camera {
     int fd;
     void* buffer_start;
     size_t buffer_length;
     int width, height;
+    uint32_t pixel_format;
+    int num_planes;
 
 public:
-    V4L2Camera(const char* dev_name = "/dev/video11", int w = 640, int h = 480) 
-        : fd(-1), buffer_start(nullptr), buffer_length(0), width(w), height(h) {
+    V4L2Camera(const char* dev_name = "/dev/video12", int w = 640, int h = 480) 
+        : fd(-1), buffer_start(nullptr), buffer_length(0), width(w), height(h), 
+          pixel_format(0), num_planes(0) {
         
         fd = open(dev_name, O_RDWR | O_NONBLOCK, 0);
         if (fd < 0) throw std::runtime_error("Не удалось открыть камеру " + std::string(dev_name));
 
-        // Устанавливаем формат NV12
-        struct v4l2_format fmt = {};
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        fmt.fmt.pix_mp.width = width;
-        fmt.fmt.pix_mp.height = height;
-        fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
-        fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
-        fmt.fmt.pix_mp.num_planes = 1; // NV12 имеет 2 плоскости, но в multiplanar API это управляется иначе
+        // Пробуем форматы в порядке приоритета
+        struct { uint32_t fmt; int planes; const char* name; } formats_to_try[] = {
+            { V4L2_PIX_FMT_NV12, 2, "NV12 (2 плоскости)" },
+            { V4L2_PIX_FMT_NV12, 1, "NV12 (1 плоскость)" },
+            { V4L2_PIX_FMT_UYVY, 1, "UYVY" },
+            { V4L2_PIX_FMT_YUYV, 1, "YUYV" }
+        };
 
-        if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-            throw std::runtime_error("Не удалось установить формат NV12 на " + std::string(dev_name));
+        bool format_set = false;
+        for (auto& f : formats_to_try) {
+            struct v4l2_format fmt = {};
+            fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            fmt.fmt.pix_mp.width = width;
+            fmt.fmt.pix_mp.height = height;
+            fmt.fmt.pix_mp.pixelformat = f.fmt;
+            fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+            fmt.fmt.pix_mp.num_planes = f.planes;
+
+            if (ioctl(fd, VIDIOC_S_FMT, &fmt) == 0) {
+                if (fmt.fmt.pix_mp.pixelformat == f.fmt) {
+                    pixel_format = f.fmt;
+                    num_planes = f.planes;
+                    width = fmt.fmt.pix_mp.width;
+                    height = fmt.fmt.pix_mp.height;
+                    format_set = true;
+                    
+                    log("Камера: установлен формат " + std::string(f.name) + " " + 
+                        std::to_string(width) + "x" + std::to_string(height));
+                    break;
+                }
+            }
         }
 
-        // Сохраняем реальные размеры, которые установил драйвер
-        width = fmt.fmt.pix_mp.width;
-        height = fmt.fmt.pix_mp.height;
+        if (!format_set) {
+            throw std::runtime_error("Не удалось установить поддерживаемый формат на " + std::string(dev_name));
+        }
 
-        log("Камера: " + std::string(dev_name) + " формат NV12 " + std::to_string(width) + "x" + std::to_string(height));
-
-        // Запрашиваем буферы
         struct v4l2_requestbuffers req = {};
         req.count = 1;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         req.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-            throw std::runtime_error("VIDIOC_REQBUFS ошибка");
-        }
+        if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) throw std::runtime_error("VIDIOC_REQBUFS ошибка");
 
-        // Query buffer
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = 0;
-        buf.length = 1; // Количество плоскостей
         
-        struct v4l2_plane planes[1];
+        struct v4l2_plane planes[2] = {};
+        buf.length = num_planes;
         buf.m.planes = planes;
         
-        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            throw std::runtime_error("VIDIOC_QUERYBUF ошибка");
-        }
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) throw std::runtime_error("VIDIOC_QUERYBUF ошибка");
 
-        // Mmap буфера
+        // Мапим первую плоскость (для NV12 это Y-канал)
         buffer_length = planes[0].length;
         buffer_start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, planes[0].m.mem_offset);
-        if (buffer_start == MAP_FAILED) {
-            throw std::runtime_error("mmap ошибка");
-        }
+        if (buffer_start == MAP_FAILED) throw std::runtime_error("mmap ошибка");
 
-        // Queue buffer
-        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            throw std::runtime_error("VIDIOC_QBUF ошибка");
-        }
+        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) throw std::runtime_error("VIDIOC_QBUF ошибка");
 
-        // Start streaming
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-            throw std::runtime_error("VIDIOC_STREAMON ошибка");
-        }
+        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) throw std::runtime_error("VIDIOC_STREAMON ошибка");
     }
 
     ~V4L2Camera() {
         if (fd >= 0) {
             int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
             ioctl(fd, VIDIOC_STREAMOFF, &type);
-            if (buffer_start && buffer_start != MAP_FAILED) {
-                munmap(buffer_start, buffer_length);
-            }
+            if (buffer_start && buffer_start != MAP_FAILED) munmap(buffer_start, buffer_length);
             close(fd);
         }
     }
@@ -232,9 +230,10 @@ public:
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         buf.memory = V4L2_MEMORY_MMAP;
-        buf.length = 1;
+        buf.index = 0;
         
-        struct v4l2_plane planes[1];
+        struct v4l2_plane planes[2] = {};
+        buf.length = num_planes;
         buf.m.planes = planes;
 
         fd_set fds;
@@ -247,8 +246,19 @@ public:
 
         if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) return false;
 
-        // Для NV12 первые width*height байт - это Y-канал (Grayscale)
-        gray_mat = cv::Mat(height, width, CV_8UC1, buffer_start).clone();
+        if (pixel_format == V4L2_PIX_FMT_NV12) {
+            // Для NV12 первая плоскость - это чистый Y-канал (Grayscale)
+            gray_mat = cv::Mat(height, width, CV_8UC1, buffer_start).clone();
+        } else {
+            // Для UYVY/YUYV извлекаем Y-компоненту
+            cv::Mat raw_mat(height, width, CV_8UC2, buffer_start);
+            gray_mat.create(height, width, CV_8UC1);
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    gray_mat.at<uchar>(y, x) = raw_mat.at<uchar>(y, x * 2 + 1);
+                }
+            }
+        }
 
         ioctl(fd, VIDIOC_QBUF, &buf);
         return true;
@@ -259,19 +269,23 @@ public:
 };
 
 int main() {
-    log("Запуск системы контроля доступа (Socket Edition)...");
+    log("=== Запуск системы контроля доступа (Непрерывный режим) ===");
 
     try {
-        V4L2Camera cam("/dev/video0", 640, 480);
-        
+        V4L2Camera cam("/dev/video12", 640, 480);
         cv::Mat gray_frame;
-        std::string last_qr = "";
-        int stable_frame_count = 0;
-        const int REQUIRED_STABLE_FRAMES = 3;
 
-        log("Начало сканирования...");
+        auto cooldown_end_time = std::chrono::steady_clock::now();
+
+        log("Ожидание появления QR-кода в кадре...");
 
         while (true) {
+            auto now = std::chrono::steady_clock::now();
+            if (now < cooldown_end_time) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
             if (!cam.grab_gray_frame(gray_frame)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(30));
                 continue;
@@ -287,25 +301,22 @@ int main() {
 
             if (!barcodes.empty()) {
                 std::string current_qr = barcodes.front().text();
+                log("QR-код считан: " + current_qr);
 
-                if (current_qr == last_qr) {
-                    stable_frame_count++;
+                bool is_allowed = send_to_server(current_qr);
+
+                if (is_allowed) {
+                    log("========================================");
+                    log("✅ ДОСТУП РАЗРЕШЕН (Здесь будет зеленый диод)");
+                    log("========================================");
                 } else {
-                    last_qr = current_qr;
-                    stable_frame_count = 1;
+                    log("========================================");
+                    log("❌ ДОСТУП ЗАПРЕЩЕН (Здесь будет красный диод)");
+                    log("========================================");
                 }
 
-                if (stable_frame_count >= REQUIRED_STABLE_FRAMES) {
-                    log("QR-код стабилен: " + current_qr);
-                    send_to_server(current_qr);
-                    
-                    last_qr = ""; 
-                    stable_frame_count = 0;
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                }
-            } else {
-                stable_frame_count = 0;
-                last_qr = "";
+                cooldown_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(COOLDOWN_SECONDS);
+                log("Активирована пауза на " + std::to_string(COOLDOWN_SECONDS) + " сек. перед следующим сканированием...");
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(30)); 
