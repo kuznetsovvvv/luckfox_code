@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <algorithm>
 
 // V4L2
 #include <fcntl.h>
@@ -21,13 +22,13 @@
 // OpenCV & ZXing
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include <ZXing/ReadBarcode.h>
-#include <ZXing/ImageView.h>
+#include <ReadBarcode.h>
+#include <ImageView.h>
 
 const std::string LOG_FILE = "qr_scanner.log";
 
 // --- НАСТРОЙКИ СЕРВЕРА ---
-const std::string SERVER_IP = "172.32.0.100"; // Или 172.32.0.100 для USB RNDIS
+const std::string SERVER_IP = "172.32.0.100"; // IP вашего компьютера в сети USB RNDIS
 const int SERVER_PORT = 8080;
 const std::string SERVER_PATH = "/api/validate-qr";
 
@@ -48,6 +49,16 @@ void log(const std::string& message) {
     if (ofs.is_open()) ofs << formatted << "\n";
 }
 
+// Функция для удаления пробельных символов и переносов строк с концов строки
+std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\n\r");
+    if (std::string::npos == first) {
+        return str;
+    }
+    size_t last = str.find_last_not_of(" \t\n\r");
+    return str.substr(first, (last - first + 1));
+}
+
 std::string escape_json(const std::string& s) {
     std::string o;
     for (auto c : s) {
@@ -62,6 +73,8 @@ std::string escape_json(const std::string& s) {
 }
 
 bool send_to_server(const std::string& qr_text) {
+    // Очищаем строку от случайных переносов строк в конце
+    std::string clean_qr = trim(qr_text);
     log("Отправка токена на сервер: " + SERVER_IP + ":" + std::to_string(SERVER_PORT) + SERVER_PATH);
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -91,7 +104,12 @@ bool send_to_server(const std::string& qr_text) {
         return false;
     }
 
-    std::string body = "{\"qr_data\": \"" + escape_json(qr_text) + "\"}";
+    // !!! ВАЖНОЕ ИСПРАВЛЕНИЕ !!!
+    // Ваш Go-код использует `token := req.Token`, значит он ожидает ключ "token", а не "qr_data".
+    // Если ваш struct в Go выглядит как `Token string `json:"token"``, то ключ должен быть "token".
+    // (Если вдруг в Go стоит `json:"qr_data"`, верните здесь "qr_data" обратно).
+    std::string body = "{\"token\": \"" + escape_json(clean_qr) + "\"}";
+    
     std::stringstream request;
     request << "POST " << SERVER_PATH << " HTTP/1.1\r\n"
             << "Host: " << SERVER_IP << ":" << SERVER_PORT << "\r\n"
@@ -125,12 +143,13 @@ bool send_to_server(const std::string& qr_text) {
     size_t body_start = response.find("\r\n\r\n");
     std::string response_body = (body_start != std::string::npos) ? response.substr(body_start + 4) : response;
 
-    if (response_body.find("\"status\": \"success\"") != std::string::npos || 
-        response_body.find("\"status\":\"success\"") != std::string::npos) {
+    // Ищем именно "valid":true с маленькой буквы, как отдает ваш Go-бэкенд
+    if (response_body.find("\"valid\":true") != std::string::npos || 
+        response_body.find("\"valid\": true") != std::string::npos) {
         log("Сервер ответил: УСПЕХ");
         return true;
     } else {
-        log("Сервер ответил: ОТКАЗ");
+        log("Сервер ответил: ОТКАЗ (Тело ответа: " + response_body + ")");
         return false;
     }
 }
@@ -152,7 +171,6 @@ public:
         fd = open(dev_name, O_RDWR | O_NONBLOCK, 0);
         if (fd < 0) throw std::runtime_error("Не удалось открыть камеру " + std::string(dev_name));
 
-        // Пробуем форматы в порядке приоритета
         struct { uint32_t fmt; int planes; const char* name; } formats_to_try[] = {
             { V4L2_PIX_FMT_NV12, 2, "NV12 (2 плоскости)" },
             { V4L2_PIX_FMT_NV12, 1, "NV12 (1 плоскость)" },
@@ -206,7 +224,6 @@ public:
         
         if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) throw std::runtime_error("VIDIOC_QUERYBUF ошибка");
 
-        // Мапим первую плоскость (для NV12 это Y-канал)
         buffer_length = planes[0].length;
         buffer_start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, planes[0].m.mem_offset);
         if (buffer_start == MAP_FAILED) throw std::runtime_error("mmap ошибка");
@@ -247,10 +264,8 @@ public:
         if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) return false;
 
         if (pixel_format == V4L2_PIX_FMT_NV12) {
-            // Для NV12 первая плоскость - это чистый Y-канал (Grayscale)
             gray_mat = cv::Mat(height, width, CV_8UC1, buffer_start).clone();
         } else {
-            // Для UYVY/YUYV извлекаем Y-компоненту
             cv::Mat raw_mat(height, width, CV_8UC2, buffer_start);
             gray_mat.create(height, width, CV_8UC1);
             for (int y = 0; y < height; y++) {
